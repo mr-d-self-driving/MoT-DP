@@ -534,6 +534,17 @@ def train_pdm_policy(config_path):
             # This ensures proper gradient synchronization across all GPUs
             loss = policy(batch)
             
+            # Extract loss components if available (for logging)
+            if isinstance(loss, dict):
+                total_loss = loss.get('total_loss', loss.get('loss', 0))
+                diffusion_loss = loss.get('diffusion_loss', 0)
+                anchor_loss = loss.get('anchor_loss', 0)
+                loss = total_loss  # Use total_loss for backward pass
+            else:
+                # Backward compatibility: if loss is a scalar
+                diffusion_loss = loss
+                anchor_loss = 0
+            
             # Check for NaN/Inf loss to prevent gradient explosion
             if torch.isnan(loss) or torch.isinf(loss):
                 if rank == 0:
@@ -570,14 +581,20 @@ def train_pdm_policy(config_path):
             
             if batch_idx % 10 == 0 and rank == 0:
                 step = epoch * len(train_loader) + batch_idx
-                safe_wandb_log({
+                log_dict = {
                     "train/loss_step": loss.item(),
                     "train/epoch":  epoch ,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx,
                     "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                }, use_wandb)
+                }
+                # Add loss components if available
+                if isinstance(diffusion_loss, torch.Tensor):
+                    log_dict["train/diffusion_loss"] = diffusion_loss.item()
+                if isinstance(anchor_loss, torch.Tensor) and anchor_loss != 0:
+                    log_dict["train/anchor_loss"] = anchor_loss.item()
+                safe_wandb_log(log_dict, use_wandb)
         
         if rank == 0:
             pbar.close() 

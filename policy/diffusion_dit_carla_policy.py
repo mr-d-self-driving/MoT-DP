@@ -475,7 +475,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         return self.compute_loss(batch)
 
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         batch: {
             # BEV特征（二选一）
@@ -553,10 +553,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             model_dtype=model_dtype
         )
         
-        # Extract total loss
-        loss = loss_dict['total_loss']
-        
-        return loss
+        # Return the complete loss dictionary for logging
+        # Training code will extract total_loss for backward pass
+        return loss_dict
     
     def _compute_truncated_diffusion_loss(
         self,
