@@ -536,7 +536,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Get ground truth anchor point for prediction (the 5th step waypoint)
         # anchor_goal_gt: (B, 2) - ground truth waypoint at step 5 (0-indexed, so index 4)
         anchor_goal_gt = trajectory[:, -1, :].clone()  # Take the last waypoint from trajectory
-        ego_status[:, :, -4:-2] = anchor_goal_gt  # Update ego_status command to match anchor goal
+        ego_status = ego_status.clone()
+        ego_status[:, :, -4:-2] = anchor_goal_gt.unsqueeze(1)  # Update ego_status command to match anchor goal
 
 
         # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
