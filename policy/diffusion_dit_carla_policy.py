@@ -484,7 +484,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
             'agent_pos': (B, horizon, 2) - 未来轨迹点
-            'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+            'ego_status': (B, obs_horizon, 12) - 车辆状态 [speed(1), theata(1), command(6) target_point(2), waypoints_hist(2)]
             'anchor': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
         }
         """
@@ -532,11 +532,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # Get ego_status
         ego_status = nobs['ego_status'].to(dtype=model_dtype)
+        
+        # Get ground truth anchor point for prediction (the 5th step waypoint)
+        # anchor_goal_gt: (B, 2) - ground truth waypoint at step 5 (0-indexed, so index 4)
+        anchor_goal_gt = trajectory[:, -1, :].clone()  # Take the last waypoint from trajectory
+        ego_status[:, :, -4:-2] = anchor_goal_gt  # Update ego_status command to match anchor goal
+
 
         # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
-        loss = self._compute_truncated_diffusion_loss(
+        loss_dict = self._compute_truncated_diffusion_loss(
             trajectory=trajectory,
             anchor=anchor,
+            anchor_goal_gt=anchor_goal_gt,  # Pass ground truth anchor for loss computation
             cond=cond,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
@@ -545,25 +552,38 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             model_dtype=model_dtype
         )
         
+        # Extract total loss
+        loss = loss_dict['total_loss']
+        
         return loss
     
     def _compute_truncated_diffusion_loss(
         self,
         trajectory: torch.Tensor,
         anchor: torch.Tensor,
+        anchor_goal_gt: torch.Tensor,  # Ground truth anchor (B, 2) - the 5th waypoint
         cond: torch.Tensor,
         gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """
         Compute loss using truncated diffusion (DiffusionDriveV2 style).
         Instead of starting from pure noise, we start from anchor with multiplicative noise.
         The model predicts the clean sample directly.
         
+        Additionally, predicts the 5th waypoint (anchor point) from encoder hidden states and computes anchor loss.
+        This replaces the concept of target point with a predicted anchor at step 5.
+        
         Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
+        
+        Returns:
+            dict with keys:
+                - 'total_loss': weighted sum of diffusion loss and anchor loss
+                - 'diffusion_loss': trajectory prediction loss
+                - 'anchor_loss': anchor point (5th waypoint) prediction loss
         """
         batch_size = trajectory.shape[0]
         
@@ -593,30 +613,44 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 5. Denormalize for model input (model expects denormalized coordinates)
         noisy_trajectory_denorm = self.denorm_odo(noisy_anchor)
         
-        # 6. Predict clean sample
-        pred = self.model(
+        # 6. Predict clean sample and anchor points
+        pred, pred_anchor = self.model(
             noisy_trajectory_denorm,
             timesteps,  # Use the sampled timesteps
             cond,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
-            ego_status=ego_status
+            ego_status=ego_status,
+            return_anchor=True  # Request anchor prediction
         )
         
-        # 7. Compute loss - predict clean sample (not noise)
+        # 7. Compute diffusion loss - predict clean sample (not noise)
         # Target is the ground truth trajectory (denormalized)
         # DiffusionDrive uses L1 loss
         target = trajectory
         
-        loss = F.l1_loss(pred, target, reduction='none')
+        diffusion_loss = F.l1_loss(pred, target, reduction='none')
         
-        if loss.shape[-1] > 2:
-            loss = loss[..., :2]
+        if diffusion_loss.shape[-1] > 2:
+            diffusion_loss = diffusion_loss[..., :2]
         
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
+        diffusion_loss = diffusion_loss.mean()
         
-        return loss
+        # 8. Compute anchor loss - predict the 5th waypoint from encoder
+        # pred_anchor: (B, 2), anchor_goal_gt: (B, 2) - single waypoint at step 5
+        anchor_loss = F.l1_loss(pred_anchor, anchor_goal_gt, reduction='mean')
+        
+        # 9. Combine losses with weighting
+        # You can adjust the weight for anchor_loss
+        anchor_loss_weight = self.cfg.get('anchor_loss_weight', 0.5)  # Default weight is 0.5
+        total_loss = diffusion_loss + anchor_loss_weight * anchor_loss
+        
+        return {
+            'total_loss': total_loss,
+            'diffusion_loss': diffusion_loss,
+            'anchor_loss': anchor_loss
+        }
 
     def conditional_sample(self, 
             condition_data, condition_mask,

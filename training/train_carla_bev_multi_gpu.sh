@@ -5,10 +5,11 @@
 # pkill -9 -f "train_carla_bev"
 
 # Select GPUs 1-7 (excluding GPU 0)
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+#export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=1
 
 # Default values
-NUM_GPUS=${1:-7}  # Default to 7 GPUs (GPU 1-7)
+NUM_GPUS=${1:-1}  # Default to 1 GPU
 CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml"}
 
 # Set environment variables for better performance

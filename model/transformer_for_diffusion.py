@@ -852,6 +852,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # trajectory head block (with Residual Refinement and Temporal Smoothing)
         self.trajectory_head = TrajectoryRefinementHead(n_emb, output_dim, p_drop_emb)
         
+        # Anchor prediction head - predicts the 5th future waypoint from encoder memory
+        # Input: memory pooled from encoder (B, n_emb)
+        # Output: single waypoint at step 5 (B, 2) where 2 is (x, y)
+        self.anchor_prediction_head = nn.Sequential(
+            nn.LayerNorm(n_emb),
+            nn.Linear(n_emb, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop_emb),
+            nn.Linear(n_emb, 2)  # Single waypoint (x, y) at step 5
+        )
+        
         # constants
         self.T = T
         self.T_cond = T_cond
@@ -1207,15 +1218,21 @@ class TransformerForDiffusion(ModuleAttrMixin):
         gen_vit_tokens: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        return_anchor: bool = False,  # Whether to return predicted anchor points
         **kwargs):
         """
-        x: (B,T,input_dim)
-        timestep: (B,) or int, diffusion step
-        cond: (B,T',cond_dim)
-        gen_vit_tokens: (B, seq_len, feat_dim) - VIT tokens from VQA
-        answer_token_indexes: (B, max_answer_tokens) - answer token indices
-        ego_status: (B, status_dim) current ego status
-        output: (B,T,input_dim)
+        Args:
+            sample: (B, T, input_dim) noisy trajectory
+            timestep: diffusion timestep
+            cond: (B, n_obs_steps, cond_dim) condition features
+            gen_vit_tokens: (B, seq_len, vl_emb_dim) VL features
+            reasoning_query_tokens: (B, seq_len, reasoning_emb_dim) reasoning features
+            ego_status: (B, status_dim) or (B, n_obs_steps, status_dim) ego status
+            return_anchor: if True, return (output, predicted_anchor), else return output only
+            
+        Returns:
+            if return_anchor=False: output trajectory (B, T, output_dim)
+            if return_anchor=True: (output trajectory, predicted anchor) where predicted_anchor is (B, 2) - the 5th waypoint
         """
         # Ensure all inputs match the model's dtype (important for bfloat16 models)
         model_dtype = next(self.parameters()).dtype
@@ -1337,6 +1354,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Slice output if history was added (keep only future)
         if hist_features is not None:
             x = x[:, -t:, :]
+        
+        # 8. Predict anchor point from encoder memory if requested
+        predicted_anchor = None
+        if return_anchor:
+            # Use memory from encoder to predict the 5th future waypoint
+            # Pool memory to get a global representation: (B, T_cond, n_emb) -> (B, n_emb)
+            memory_pooled = memory.mean(dim=1)  # Global average pooling
+            
+            # Predict anchor: (B, n_emb) -> (B, 2)
+            predicted_anchor = self.anchor_prediction_head(memory_pooled)  # (B, 2)
+            
+            return x, predicted_anchor
             
         return x
 

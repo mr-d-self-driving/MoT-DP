@@ -151,9 +151,9 @@ class DisplayInterface(object):
         surface[440:600,1000:1200] = trajectory[0:160,:]
         surface = cv2.putText(surface, input_data['language_1'], (20,560), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
         surface = cv2.putText(surface, input_data['language_2'], (20,580), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
-        surface = cv2.putText(surface, input_data['control'], (20,540), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
-        surface = cv2.putText(surface, input_data['speed'], (20,520), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
-        surface = cv2.putText(surface, input_data['time'], (20,500), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
+        surface = cv2.putText(surface, input_data['control'], (20,540), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
+        surface = cv2.putText(surface, input_data['speed'], (20,520), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
+        surface = cv2.putText(surface, input_data['time'], (20,500), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
 
         # surface = cv2.putText(surface, 'Left  View', (40,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
         # surface = cv2.putText(surface, 'Focus View', (335,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
@@ -595,7 +595,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		print("✓ MoT model loaded.")
 
 		self.turn_controller = LateralPIDController(inference_mode=True)  # Set inference_mode=True for model predictions
-		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  
+		self.speed_controller = t_u.PIDController(k_p=1.35, k_i=1.0, k_d=2.0, n=20)  # kp 1.75
 		
 		# Control config 
 		self.carla_fps = 20
@@ -607,12 +607,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.clip_throttle = 1.0
 		self.stuck_threshold = 200 #800
 		self.stuck_helper_threshold = 100
+		self.stuck_creeper_threshold = 100
+
 		self.creep_duration = 15
 		self.creep_throttle = 0.4
 		
 		# Stuck detection
 		self.stuck_detector = 0
 		self.stuck_helper = 0
+		self.stuck_creeper = 0
 		self.force_move = 0
 
 		self.steer_step = 0
@@ -660,7 +663,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
 			string = self.save_name
-			print (string)
 
 		self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
 		self.save_path.mkdir(parents=True, exist_ok=False)
@@ -1026,15 +1028,26 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 
 		
+		# if len(waypoint_route) > 2:
+		# 	target_point, far_command = waypoint_route[1]
+		# 	next_target_point, next_far_command = waypoint_route[2]
+		# elif len(waypoint_route) > 1:
+		# 	target_point, far_command = waypoint_route[1]
+		# 	next_target_point, next_far_command = waypoint_route[1]
+		# else:
+		# 	target_point, far_command = waypoint_route[0]
+		# 	next_target_point, next_far_command = waypoint_route[0]
+
 		if len(waypoint_route) > 2:
-			target_point, far_command = waypoint_route[1]
-			next_target_point, next_far_command = waypoint_route[2]
+			target_point, far_command = waypoint_route[-1]
+			next_target_point, next_far_command = waypoint_route[-1]
 		elif len(waypoint_route) > 1:
-			target_point, far_command = waypoint_route[1]
-			next_target_point, next_far_command = waypoint_route[1]
+			target_point, far_command = waypoint_route[-1]
+			next_target_point, next_far_command = waypoint_route[-1]
 		else:
-			target_point, far_command = waypoint_route[0]
-			next_target_point, next_far_command = waypoint_route[0]
+			target_point, far_command = waypoint_route[-1]
+			next_target_point, next_far_command = waypoint_route[-1]
+
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
@@ -1048,17 +1061,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['next_command'] = self.commands[-2]
 		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass']) #result['compass'])
 		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass']) #result['compass'])
-
-		# Debug: print target point transformation
-		if self.step <= 5:
-			print(f"  target_point (world): {target_point[:2]}")
-			print(f"  ego position (gps): {result['gps']}")
-			print(f"  compass (heading): {result['compass']:.4f} rad ({np.rad2deg(result['compass']):.2f} deg)")
-			print(f"  ego_target_point: {ego_target_point}")
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
 		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
 		result['theta'] = compass_filtered  # Use UKF filtered compass
+
+
+		# ==============debug=========		
+		print(f"  target_point (world): {target_point[:2]}")
+		print(f"  ego position (gps): {result['gps']}")
+		print(f"  compass (heading): {result['compass']:.4f} rad ({np.rad2deg(result['compass']):.2f} deg)")
+		print(f"  ego_target_point: {ego_target_point}")
 
 		return result
 	
@@ -1079,12 +1092,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
 		mot_waypoint_interval = 0.5  # seconds between waypoints
-		one_second_idx = 1  # point[1] is at 1.0s
+		one_second_idx = 2  # point[1] is at 1.0s
 		half_second_idx = 0  # point[0] is at 0.5s
 		
 		if speed_waypoints_np.shape[0] >= 2:
 			# Displacement from 0.5s to 1.0s position, multiply by 2 to get m/s
-			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0
+			# desired_speed = (np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0)
+			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx])
+			# desired_speed += 0.75*(np.linalg.norm(speed_waypoints_np[0]) * 2.0)
 		else:
 			# Fallback: use first point distance, assuming it represents 0.5s travel
 			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
@@ -1095,11 +1110,39 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		throttle = self.speed_controller.step(delta)
 		throttle = np.clip(throttle, 0.0, self.clip_throttle)
 		throttle = throttle if not brake else 0.0
+
+		# Speed limit 
+		# max_speed = 6.0  # m/s
+		# if speed > max_speed:
+		# 	print(f"⚠️ Speed limit exceeded: {speed:.2f} m/s > {max_speed:.2f} m/s, applying brake")
+		# 	brake = True
+		# 	throttle = 0.1
+		# else:
+		# 	# Clamp desired speed to max speed
+		# 	desired_speed = min(desired_speed, max_speed)
+			
+		# 	brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
+			
+		# 	delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
+		# 	throttle = self.speed_controller.step(delta)
+		# 	throttle = np.clip(throttle, 0.0, self.clip_throttle)
+		# 	throttle = throttle if not brake else 0.0
 		
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
 		
+		# DEBUG: Print interpolated route and lookahead point
+		speed_kmh = speed * 3.6
+		n_lookahead = np.clip(0.9755 * speed_kmh + 1.9153, 24, 105) / 10 - 2
+		n_lookahead = int(min(n_lookahead, route_interp.shape[0] - 1))
+		lookahead_pt = route_interp[n_lookahead]
+		yaw_rad = np.arctan2(lookahead_pt[1], lookahead_pt[0])
+		yaw_deg = np.degrees(yaw_rad)
+		print(f"[DEBUG] control_pid: speed={speed:.2f}m/s, n_lookahead={n_lookahead}")
+		print(f"[DEBUG] lookahead_pt: x={lookahead_pt[0]:.3f}, y={lookahead_pt[1]:.3f}, yaw_deg={yaw_deg:.2f}")
+		
 		steer = self.turn_controller.step(route_interp, speed)
+		print(f"[DEBUG] steer output: {steer:.4f}")
 		steer = np.clip(steer, -1.0, 1.0)
 		steer = round(steer, 3)
 		
@@ -1262,13 +1305,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			dp_pred_traj = self.net.predict_action(dp_obs_dict)
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			print("dp_pred_traj:", dp_pred_traj)
-
-
+			# self.last_dp_pred_traj=np.zeros_like(self.last_dp_pred_traj) # debug
 
 			# ================== control_pid method ==================
-			route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
-			speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
+			#route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
+			#speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
+			route_waypoints = torch.from_numpy(dp_pred_traj['action']) # (1, 6, 2) - use as route_waypoints
+			speed_waypoints = torch.from_numpy(dp_pred_traj['action']) # (1, 6, 2) - use as speed_waypoints (same for MoT)
 			gt_velocity = tick_data['speed']
+			# import pdb; pdb.set_trace()
+			# DEBUG: Print trajectory values to diagnose left-drift
+			traj_np = pred_traj[0].float().cpu().numpy()  # Convert BFloat16 -> Float32 -> numpy
+			print(f"[DEBUG] pred_traj (ego frame [x_fwd, y_left]):")
+			for i, pt in enumerate(traj_np):
+				print(f"  point[{i}]: x={pt[0]:.3f}, y={pt[1]:.3f}")
+			print(f"[DEBUG] target_point: x={target_point[0,0].item():.3f}, y={target_point[0,1].item():.3f}")
 			
 			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
 			
@@ -1278,7 +1329,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					self.stuck_helper += 1
 				self.stuck_detector += 1
 			
-			if self.stuck_helper > self.stuck_helper_threshold or gt_velocity > 3.0:
+			if self.stuck_helper > self.stuck_helper_threshold or gt_velocity > 3:
 					self.stuck_helper = 0
 					self.stuck_detector = 0
 			
@@ -1286,7 +1337,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"stuck_helper: {self.stuck_helper}")
 			print(f"stuck_detector: {self.stuck_detector}")
 
-			
+			if self.stuck_helper > 0 and gt_velocity < 0.5:
+				print("Stuck helper activated: hhhhh")
+				throttle = 0.25
+				steer = -0.15
+				brake = 0.0
+	
+
 			control = carla.VehicleControl()
 			control.steer = float(steer)
 			control.throttle = float(throttle)
