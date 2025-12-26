@@ -182,7 +182,19 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                         batch[key] = batch[key].to(device)
 
                 loss = model_for_inference.compute_loss(batch)
-                val_metrics['loss'].append(loss.item())
+                
+                # Extract loss components if available
+                if isinstance(loss, dict):
+                    total_loss = loss.get('total_loss', loss.get('loss', 0))
+                    diffusion_loss = loss.get('diffusion_loss', 0)
+                    anchor_loss = loss.get('anchor_loss', 0)
+                    val_metrics['loss'].append(total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss)
+                    val_metrics['diffusion_loss'].append(diffusion_loss.item() if isinstance(diffusion_loss, torch.Tensor) else diffusion_loss)
+                    val_metrics['anchor_loss'].append(anchor_loss.item() if isinstance(anchor_loss, torch.Tensor) else anchor_loss)
+                else:
+                    val_metrics['loss'].append(loss.item())
+                    val_metrics['diffusion_loss'].append(loss.item())
+                    val_metrics['anchor_loss'].append(0.0)
                 
                 obs_dict = {
                     'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
@@ -212,8 +224,10 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
-                        
-                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                    
+                    # Get current loss for progress bar display
+                    current_loss = val_metrics['loss'][-1] if val_metrics['loss'] else 0.0
+                    pbar.set_postfix({'val_loss': f'{current_loss:.4f}'})
                 except Exception as e:
                     print(f"Warning: Error in action prediction during validation: {e}")
                     continue
@@ -659,10 +673,16 @@ def train_pdm_policy(config_path):
             
                 if 'val_loss' in val_metrics:
                     log_dict["val/loss"] = val_metrics['val_loss']
+                
+                # Add validation loss components
+                if 'val_diffusion_loss' in val_metrics:
+                    log_dict["val/diffusion_loss"] = val_metrics['val_diffusion_loss']
+                if 'val_anchor_loss' in val_metrics:
+                    log_dict["val/anchor_loss"] = val_metrics['val_anchor_loss']
             
                 for key, value in val_metrics.items():
-                    if key == 'val_loss':
-                        continue  
+                    if key in ['val_loss', 'val_diffusion_loss', 'val_anchor_loss']:
+                        continue  # Already logged above
                     elif key.startswith('val_'):
                         # Remove 'val_' prefix
                         metric_name = key.replace('val_', '')
