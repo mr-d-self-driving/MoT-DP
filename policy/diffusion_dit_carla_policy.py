@@ -701,6 +701,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         - The model predicts the CLEAN trajectory directly (not noise, not residual)
         - Uses multiplicative noise with scheduler-based variance (timestep-dependent)
         - Final output is the model's direct prediction
+        
+        Note: ego_status should already have the predicted anchor in target_point position (8:10)
+              from the predict_action method before calling this function.
         """
         bs = anchor.shape[0]
         
@@ -811,6 +814,30 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ego_status = nobs['ego_status']  # (B, ego_status_dim)
         # Ensure ego_status has the correct dtype
         ego_status = ego_status.to(dtype=model_dtype)
+        
+        # Predict anchor point using encoder and replace target_point in ego_status
+        # First, encode conditions to get memory
+        memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask = self.model.encode_conditions(
+            cond=cond,
+            gen_vit_tokens=gen_vit_tokens,
+            reasoning_query_tokens=reasoning_query_tokens
+        )
+        
+        # Global average pooling on encoder memory to get anchor prediction input
+        memory_pooled = memory.mean(dim=1)  # (B, n_emb)
+        
+        # Predict anchor point (5th waypoint)
+        predicted_anchor_goal = self.model.anchor_prediction_head(memory_pooled)  # (B, 2)
+        
+        # Replace target_point in ego_status (indices 8:10) with predicted anchor
+        # ego_status structure: [speed(1), theta(1), command(6), target_point(2), waypoints_hist(2)]
+        # We update the last observation step's target_point
+        if ego_status.dim() == 3:  # (B, obs_horizon, status_dim)
+            ego_status = ego_status.clone()
+            ego_status[:, -1, -4:-2] = predicted_anchor_goal  # Replace target_point with predicted anchor
+        elif ego_status.dim() == 2:  # (B, status_dim)
+            ego_status = ego_status.clone()
+            ego_status[:, -4:-2] = predicted_anchor_goal  # Replace target_point with predicted anchor
         
         # Get anchor for truncated diffusion (if available)
         anchor = nobs.get('anchor', None)
