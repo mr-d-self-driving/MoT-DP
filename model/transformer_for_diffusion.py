@@ -366,6 +366,23 @@ class CustomEncoderBlock(nn.Module):
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_encoder_norm = nn.LayerNorm(n_emb)
         
+        # VL features processing
+        self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
+        self.vl_emb_norm = nn.LayerNorm(n_emb)
+        self.vl_attention_pooling = MultiheadAttentionWithQKNorm(
+            embed_dim=n_emb,
+            num_heads=n_head,
+            dropout=p_drop_attn,
+            batch_first=True,
+            norm_type="rmsnorm"
+        )
+        self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
+
+        # Position embedding and preprocessing
+        self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
+        self.drop = nn.Dropout(p_drop_emb)
+        self.pre_encoder_norm = nn.LayerNorm(n_emb)
+        
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=n_emb,
