@@ -531,13 +531,24 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
         # Get ego_status
-        ego_status = nobs['ego_status'].to(dtype=model_dtype)
+        ego_status = nobs['ego_status'].to(dtype=model_dtype)  # (B, obs_horizon, state_dim)
         
-        # Get ground truth anchor point for prediction (the 5th step waypoint)
-        # anchor_goal_gt: (B, 2) - ground truth waypoint at step 5 (0-indexed, so index 4)
-        anchor_goal_gt = trajectory[:, -1, :].clone()  # Take the last waypoint from trajectory
+        # Get ground truth anchor point for prediction (mid-point between 2nd and 3rd waypoints)
+        # anchor_goal_gt: (B, 2) - ground truth mid-point between index 1 and 2 (shorter horizon than last waypoint)
+        anchor_goal_gt = (trajectory[:, 1, :] + trajectory[:, 2, :]) / 2.0  # Mid-point between 2nd and 3rd waypoints
+        
+        # Add noise to anchor_goal before putting into ego_status to prevent input-output identity
+        # Use small Gaussian noise to maintain information while preventing overfitting
+        anchor_goal_noise_std = self.cfg.get('anchor_goal_noise_std', 0.5)  # Default 0.5m standard deviation
+        anchor_goal_noisy = anchor_goal_gt + torch.randn_like(anchor_goal_gt) * anchor_goal_noise_std
+        
+        # Extend ego_status with noisy anchor_goal repeated across history
+        # Keep original target_point unchanged (they have different distributions: ~50m vs ~0-15m)
+        # ego_status: (B, obs_horizon, state_dim) -> (B, obs_horizon, state_dim+2)
         ego_status = ego_status.clone()
-        ego_status[:, :, -4:-2] = anchor_goal_gt.unsqueeze(1)  # Update ego_status command to match anchor goal
+        # Repeat the current noisy anchor goal across all obs steps (stable training)
+        anchor_goal_expanded = anchor_goal_noisy.unsqueeze(1).expand(-1, ego_status.shape[1], -1)  # (B, obs_horizon, 2)
+        ego_status = torch.cat([ego_status, anchor_goal_expanded], dim=-1)  # (B, obs_horizon, state_dim+2)
 
 
         # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
@@ -574,8 +585,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Instead of starting from pure noise, we start from anchor with multiplicative noise.
         The model predicts the clean sample directly.
         
-        Additionally, predicts the 5th waypoint (anchor point) from encoder hidden states and computes anchor loss.
-        This replaces the concept of target point with a predicted anchor at step 5.
+        Additionally, predicts the anchor goal (mid-point between 2nd and 3rd waypoints) from encoder hidden states.
+        The noisy anchor goal is fed as input to prevent input-output identity, while clean anchor goal is used as loss target.
         
         Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
         
@@ -637,8 +648,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
         diffusion_loss = diffusion_loss.mean()
         
-        # 8. Compute anchor loss - predict the 5th waypoint from encoder
-        # pred_anchor: (B, 2), anchor_goal_gt: (B, 2) - single waypoint at step 5
+        # 8. Compute anchor loss - predict the mid-point between 2nd and 3rd waypoints from encoder
+        # pred_anchor: (B, 2), anchor_goal_gt: (B, 2) - mid-point between 2nd and 3rd waypoints (clean GT, no noise)
         anchor_loss = F.l1_loss(pred_anchor, anchor_goal_gt, reduction='mean')
         
         # 9. Combine losses with weighting
@@ -772,9 +783,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 4. Return the model's direct prediction (NOT denorm_odo(diffusion_output))
         return pred
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_anchor_goal(self, obs_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        PART 1: Encode observations and predict anchor goal.
+        
+        Returns:
+            (predicted_anchor_goal, cond, gen_vit_tokens, reasoning_query_tokens, memory_pooled_for_decoder, ego_status)
+            - predicted_anchor_goal: (B, 2) - raw predicted anchor
+            - cond: (B, To, feature_dim) - encoded condition features
+            - gen_vit_tokens: (B, seq_len, n_emb) - projected VIT tokens
+            - reasoning_query_tokens: (B, seq_len, n_emb) - projected reasoning tokens
+            - memory_pooled_for_decoder: (B, n_emb) - encoder memory (for potential future use)
+            - ego_status: (B, status_dim) - base ego status without anchor
+        """
         device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype  # Get model dtype
+        model_dtype = next(self.parameters()).dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
@@ -784,91 +807,154 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Do = self.obs_feature_dim
         To = self.n_obs_steps
 
-        # handle different ways of passing observation
-        cond = None
-        cond_data = None
-        cond_mask = None
+        # Extract and encode BEV features
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
         feature_dim = batch_features.shape[-1]
         cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-        cond = cond.to(dtype=model_dtype)  # Ensure cond has correct dtype
-        shape = (B, T, Da)
-       
-        cond_data = torch.zeros(size=shape, device=device, dtype=model_dtype)  # Use model dtype
-        cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        cond = cond.to(dtype=model_dtype)
 
-        # run sampling
-        gen_vit_tokens = nobs['gen_vit_tokens']
-        reasoning_query_tokens = nobs['reasoning_query_tokens']
+        # Process VIT and reasoning tokens
+        gen_vit_tokens = nobs['gen_vit_tokens'].to(device=device, dtype=model_dtype)
+        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)
         
-        # Process gen_vit_tokens through feature_encoder
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
-        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
-        
-        # Process reasoning_query_tokens through feature_encoder
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
-        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
-        
-        # Use current ego_status instead of full history
-        ego_status = nobs['ego_status']  # (B, ego_status_dim)
-        # Ensure ego_status has the correct dtype
-        ego_status = ego_status.to(dtype=model_dtype)
-        
-        # Predict anchor point using encoder and replace target_point in ego_status
-        # First, encode conditions to get memory
-        memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask = self.model.encode_conditions(
+        reasoning_query_tokens = nobs['reasoning_query_tokens'].to(device=device, dtype=model_dtype)
+        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
+
+        # Get ego_status (base status without anchor)
+        ego_status = nobs['ego_status'].to(dtype=model_dtype)  # (B, status_dim) or (B, To, status_dim)
+
+        # Encode conditions to get fused anchor features (fusion is now inside encoder_block)
+        memory, vl_features, reasoning_features, anchor_features, vl_padding_mask, reasoning_padding_mask = self.model.encode_conditions(
             cond=cond,
             gen_vit_tokens=gen_vit_tokens,
-            reasoning_query_tokens=reasoning_query_tokens
+            reasoning_query_tokens=reasoning_query_tokens,
+            reasoning_use_first_token=True,  # Use only first text token for anchor prediction
         )
+
+        # Predict anchor goal from fused features (B, n_emb) -> (B, 2)
+        predicted_anchor_goal = self.model.anchor_prediction_head(anchor_features)  # (B, 2)
+
+        return predicted_anchor_goal, cond, gen_vit_tokens, reasoning_query_tokens, anchor_features, ego_status
+
+    def predict_action_from_anchor(
+        self, 
+        ego_status_with_anchor: torch.Tensor,
+        cond: torch.Tensor,
+        gen_vit_tokens: torch.Tensor,
+        reasoning_query_tokens: torch.Tensor,
+        anchor: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        PART 2: Decoder - sample trajectory using anchor-augmented ego_status.
         
-        # Global average pooling on encoder memory to get anchor prediction input
-        memory_pooled = memory.mean(dim=1)  # (B, n_emb)
-        
-        # Predict anchor point (5th waypoint)
-        predicted_anchor_goal = self.model.anchor_prediction_head(memory_pooled)  # (B, 2)
-        
-        # Replace target_point in ego_status (indices 8:10) with predicted anchor
-        # ego_status structure: [speed(1), theta(1), command(6), target_point(2), waypoints_hist(2)]
-        # We update the last observation step's target_point
-        if ego_status.dim() == 3:  # (B, obs_horizon, status_dim)
-            ego_status = ego_status.clone()
-            ego_status[:, -1, -4:-2] = predicted_anchor_goal  # Replace target_point with predicted anchor
-        elif ego_status.dim() == 2:  # (B, status_dim)
-            ego_status = ego_status.clone()
-            ego_status[:, -4:-2] = predicted_anchor_goal  # Replace target_point with predicted anchor
-        
-        # Get anchor for truncated diffusion (if available)
-        anchor = nobs.get('anchor', None)
+        Args:
+            ego_status_with_anchor: (B, [obs_horizon,] status_dim+2) - ego_status with appended anchor_goal
+            cond: (B, To, feature_dim) - encoded condition features
+            gen_vit_tokens: (B, seq_len, n_emb) - projected VIT tokens
+            reasoning_query_tokens: (B, seq_len, n_emb) - projected reasoning tokens
+            anchor: (B, T, 2) - anchor trajectory (optional, for truncated diffusion)
+            
+        Returns:
+            {
+                'action': numpy array of shape (B, T, 2)
+                'action_pred': torch tensor of shape (B, T, 2)
+            }
+        """
+        device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+
+        B = ego_status_with_anchor.shape[0]
+        T = self.horizon
+        Da = self.action_dim
+
+        # Prepare condition data and mask for sampling
+        cond_data = torch.zeros((B, T, Da), device=device, dtype=model_dtype)
+        cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+
+        # Ensure inputs have correct dtype
+        ego_status_with_anchor = ego_status_with_anchor.to(dtype=model_dtype)
+        cond = cond.to(dtype=model_dtype)
+        gen_vit_tokens = gen_vit_tokens.to(dtype=model_dtype)
+        reasoning_query_tokens = reasoning_query_tokens.to(dtype=model_dtype)
+
+        # Handle anchor
         if anchor is not None:
             anchor = anchor.to(device=device, dtype=model_dtype)
-            # Ensure anchor has correct shape (B, T, 2)
             if anchor.dim() == 2:
-                anchor = anchor.unsqueeze(0)  # Add batch dim
+                anchor = anchor.unsqueeze(0)
             if anchor.shape[0] != B:
                 anchor = anchor.expand(B, -1, -1)
         
+        # Conditional sampling
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
-            ego_status=ego_status,
+            ego_status=ego_status_with_anchor,
             anchor=anchor
         )
         
         naction_pred = nsample[...,:Da]
-        
-        # For truncated diffusion, the output is already in original scale
-        # No need to unnormalize
-        
-        # Convert to float32 before numpy (numpy doesn't support bfloat16)
         action_pred = naction_pred.detach().float().cpu().numpy()
-        action = action_pred
+        
         result = {
-            'action': action,
-            'action_pred': action_pred
+            'action': action_pred,
+            'action_pred': action_pred,
         }
+        return result
+
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Combined predict_action for backward compatibility.
+        Returns both action and predicted_anchor_goal for agent to process.
+        
+        NOTE: In inference with KF smoothing:
+        1. predict_anchor_goal() predicts raw anchor
+        2. Agent applies KF smoothing and concatenates smoothed anchor to ego_status
+        3. predict_action_from_anchor() does the decoding
+        
+        This method combines them for direct inference without agent-side KF.
+        """
+        device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+
+        # PART 1: Predict anchor goal
+        predicted_anchor_goal, cond, gen_vit_tokens, reasoning_query_tokens, memory_pooled, ego_status = \
+            self.predict_anchor_goal(obs_dict)
+
+        # Extend ego_status with predicted anchor (this will be replaced with smoothed anchor in agent)
+        if ego_status.dim() == 3:  # (B, obs_horizon, status_dim)
+            ego_status = ego_status.clone()
+            anchor_goal_expanded = predicted_anchor_goal.unsqueeze(1).expand(-1, ego_status.shape[1], -1)
+            ego_status = torch.cat([ego_status, anchor_goal_expanded], dim=-1)
+        elif ego_status.dim() == 2:  # (B, status_dim)
+            ego_status = ego_status.clone()
+            ego_status = torch.cat([ego_status, predicted_anchor_goal], dim=-1)
+
+        # Get anchor for truncated diffusion (if available)
+        nobs = dict_apply(obs_dict, lambda x: x.to(device))
+        anchor = nobs.get('anchor', None)
+        if anchor is not None:
+            anchor = anchor.to(device=device, dtype=model_dtype)
+            if anchor.dim() == 2:
+                anchor = anchor.unsqueeze(0)
+            if anchor.shape[0] != ego_status.shape[0]:
+                anchor = anchor.expand(ego_status.shape[0], -1, -1)
+
+        # PART 2: Decode trajectory
+        result = self.predict_action_from_anchor(
+            ego_status_with_anchor=ego_status,
+            cond=cond,
+            gen_vit_tokens=gen_vit_tokens,
+            reasoning_query_tokens=reasoning_query_tokens,
+            anchor=anchor
+        )
+
+        # Add predicted anchor goal for visualization
+        anchor_goal_np = predicted_anchor_goal.detach().float().cpu().numpy()
+        result['anchor_goal'] = anchor_goal_np
+
         return result

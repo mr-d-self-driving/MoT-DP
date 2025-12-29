@@ -347,7 +347,7 @@ class CustomEncoderBlock(nn.Module):
     Encoder block that handles condition embedding, VL pooling, encoding, and memory projection
     """
     def __init__(self, n_emb, n_head, n_cond_layers, p_drop_emb, p_drop_attn, vl_emb_dim, 
-                 obs_as_cond, cond_dim, T_cond, reasoning_emb_dim=1536):
+                 obs_as_cond, cond_dim, T_cond, heading_dim, reasoning_emb_dim=1536):
         super().__init__()
         self.n_emb = n_emb
         self.obs_as_cond = obs_as_cond
@@ -360,31 +360,7 @@ class CustomEncoderBlock(nn.Module):
         self.cond_obs_emb = None
         if obs_as_cond:
             self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
-        
-        # VL features processing
-        self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
-        self.vl_emb_norm = nn.LayerNorm(n_emb)
-        self.vl_attention_pooling = MultiheadAttentionWithQKNorm(
-            embed_dim=n_emb,
-            num_heads=n_head,
-            dropout=p_drop_attn,
-            batch_first=True,
-            norm_type="rmsnorm"
-        )
-        self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
-
-        # Reasoning features processing
-        self.reasoning_emb_dim = reasoning_emb_dim
-        self.reasoning_emb_proj = nn.Linear(reasoning_emb_dim, n_emb)
-        self.reasoning_emb_norm = nn.LayerNorm(n_emb)
-        self.reasoning_attention_pooling = MultiheadAttentionWithQKNorm(
-                embed_dim=n_emb,
-                num_heads=n_head,
-                dropout=p_drop_attn,
-                batch_first=True,
-                norm_type="rmsnorm"
-            )
-        self.reasoning_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.heading_emb = nn.Linear(heading_dim, n_emb)
         
         # Position embedding and preprocessing
         self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
@@ -440,15 +416,23 @@ class CustomEncoderBlock(nn.Module):
         return pooled_features  # (B, 1, n_emb)
     
     def forward(self, vl_embeds: torch.Tensor, reasoning_embeds: Optional[torch.Tensor] = None, 
-                cond: Optional[torch.Tensor] = None, vl_padding_mask: Optional[torch.Tensor] = None,
+                cond: Optional[torch.Tensor] = None, heading: Optional[torch.Tensor] = None,
+                vl_padding_mask: Optional[torch.Tensor] = None,
                 reasoning_padding_mask: Optional[torch.Tensor] = None):
         """
         vl_embeds: (B, T_vl, D_vl) vision-language embeddings
         reasoning_embeds: (B, T_r, D_r) reasoning embeddings
         cond: (B, T_cond, cond_dim) condition tensor
+        heading: (B, T_cond, heading_dim) heading tensor
         vl_padding_mask: (B, T_vl) padding mask for VL features
         reasoning_padding_mask: (B, T_r) padding mask for reasoning features
         Note: timestep is removed - memory generation does not use timesteps
+        
+        Returns:
+            memory: (B, T_cond, n_emb) - memory for decoder
+            vl_features: (B, T_vl, n_emb) - full VL sequence
+            reasoning_features: (B, T_r, n_emb) - full reasoning sequence
+            anchor_features: (B, n_emb) - pooled memory for anchor prediction (auxiliary task)
         """
         
         # 1. Process VL features
@@ -456,24 +440,19 @@ class CustomEncoderBlock(nn.Module):
         vl_features = self.vl_emb_norm(vl_features)
         vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
 
-        # 2. Process Reasoning features
-        reasoning_features = None
-        reasoning_features_processed = None
+        # 2. Process Reasoning features (only use first token)
         reasoning_features = self.reasoning_emb_proj(reasoning_embeds)
         reasoning_features = self.reasoning_emb_norm(reasoning_features)
-        reasoning_features_processed = self._attention_pool_reasoning_features(reasoning_features, reasoning_padding_mask)
-        
-        # 3. Combine condition embeddings (no timestep here)
+        reasoning_first_token = reasoning_features[:, :1, :]  # (B, 1, n_emb) - only first token
         cond_list = []
-        cond_obs_emb = self.cond_obs_emb(cond)
+        cond_obs_emb = self.cond_obs_emb(cond) + self.heading_emb(heading)
         cond_list.append(cond_obs_emb)
-        
         cond_list.append(vl_features_processed)
-        cond_list.append(reasoning_features_processed)
+        cond_list.append(reasoning_first_token)
             
         cond_embeddings = torch.cat(cond_list, dim=1)
         
-        # 4. Add position embedding
+        # 5. Add position embedding
         tc = cond_embeddings.shape[1]
         if tc <= self.cond_pos_emb.shape[1]:
             position_embeddings = self.cond_pos_emb[:, :tc, :]
@@ -484,18 +463,21 @@ class CustomEncoderBlock(nn.Module):
             if tc > self.cond_pos_emb.shape[1]:
                 torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
         
-        # 5. Apply dropout and pre-norm
+        # 6. Apply dropout and pre-norm
         x = self.drop(cond_embeddings + position_embeddings)
         x = self.pre_encoder_norm(x)
         
-        # 6. Transformer encoder
+        # 7. Transformer encoder
         x = self.encoder(x)
         
-        # 7. Memory processing
+        # 8. Memory processing
         memory = self.memory_norm(x)
         memory = memory + self.memory_proj(memory)
         
-        return memory, vl_features, reasoning_features
+        # 9. Use pooled memory for anchor prediction (auxiliary task)
+        anchor_features = memory.mean(dim=1)
+        
+        return memory, vl_features, reasoning_features, anchor_features
 
 
 class CustomDecoderLayer(nn.Module):
@@ -536,6 +518,12 @@ class CustomDecoderLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, 9 * d_model, bias=True)
         )
+        self.memory_projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model)
+        )
     
     def modulate(self, x, shift, scale):
         """AdaLN modulation function"""
@@ -553,8 +541,9 @@ class CustomDecoderLayer(nn.Module):
         shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
         
         # 1. Enhance Memory with VL features (Condition Fusion)
-        memory2 = self.norm1(memory)
-        memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
+        memory = self.norm1(memory)
+        memory = memory + self.memory_projection(memory)
+        memory = self.modulate(memory, shift_mem_vl, scale_mem_vl)
             
         # Combine VL and Reasoning features for cross attention
         cross_attn_kv = vl_features
@@ -577,7 +566,7 @@ class CustomDecoderLayer(nn.Module):
                                       device=reasoning_key_padding_mask.device, dtype=torch.bool)
             cross_attn_mask = torch.cat([v_mask, reasoning_key_padding_mask], dim=1)
         
-        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, cross_attn_kv, cross_attn_kv, 
+        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory, cross_attn_kv, cross_attn_kv, 
                                                       key_padding_mask=cross_attn_mask)
         enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
         
@@ -808,7 +797,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # History Encoder for global modulation
         self.history_encoder = HistoryEncoder(status_dim, n_emb)
 
-        # Custom encoder block that handles all condition processing
+        self.heading_proj = nn.Linear(2, cond_dim) if cond_dim > 0 else None
+
+        # Custom encoder block that handles all condition processing (includes fusion logic)
         self.encoder_block = CustomEncoderBlock(
             n_emb=n_emb,
             n_head=n_head,
@@ -819,6 +810,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond=obs_as_cond,
             cond_dim=cond_dim,
             T_cond=T_cond,
+            heading_dim=2,  # Pass heading_dim for consistency
             reasoning_emb_dim=reasoning_emb_dim # Pass reasoning_emb_dim
         )
         # Custom decoder that integrates VL cross attention and pre-processing
@@ -1056,8 +1048,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
     def encode_conditions(self,
         cond: torch.Tensor,
+        heading: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
+        reasoning_use_first_token: bool = False,
         **kwargs):
         """
         Encode conditions (VL, reasoning, observations) to memory.
@@ -1067,12 +1061,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
             memory: (B, T_cond, n_emb)
             vl_features: (B, T_vl, n_emb)
             reasoning_features: (B, T_r, n_emb)
+            anchor_features: (B, n_emb) - fused multi-modal features for anchor prediction
             vl_padding_mask: (B, T_vl)
             reasoning_padding_mask: (B, T_r)
         """
         cond = cond.contiguous()
         vl_embeds = gen_vit_tokens.contiguous()
         reasoning_embeds = reasoning_query_tokens.contiguous()
+        
+        # Only use the first text token when requested (anchor goal depends on first text only)
+        if reasoning_use_first_token and reasoning_embeds.dim() == 3:
+            reasoning_embeds = reasoning_embeds[:, :1, :]
         
         # Check VL padding
         vl_padding_mask = None
@@ -1086,20 +1085,26 @@ class TransformerForDiffusion(ModuleAttrMixin):
         reasoning_padding_mask = None
         if 'reasoning_mask' in kwargs and kwargs['reasoning_mask'] is not None:
             reasoning_padding_mask = ~kwargs['reasoning_mask']
+            # If we sliced to first token, keep mask in sync
+            if reasoning_use_first_token and reasoning_padding_mask is not None and reasoning_padding_mask.dim() == 2:
+                reasoning_padding_mask = reasoning_padding_mask[:, :1]
         else:
             reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
             reasoning_padding_mask = (reasoning_norm == 0)
+            if reasoning_use_first_token and reasoning_padding_mask is not None and reasoning_padding_mask.dim() == 2:
+                reasoning_padding_mask = reasoning_padding_mask[:, :1]
         
-        # Process conditions through encoder block
-        memory, vl_features, reasoning_features = self.encoder_block(
+        # Process conditions through encoder block - always returns separate features
+        memory, vl_features, reasoning_features, anchor_features = self.encoder_block(
             vl_embeds=vl_embeds,
             reasoning_embeds=reasoning_embeds,
             cond=cond,
+            heading=heading,
             vl_padding_mask=vl_padding_mask,
-            reasoning_padding_mask=reasoning_padding_mask
+            reasoning_padding_mask=reasoning_padding_mask,
         )
         
-        return memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask
+        return memory, vl_features, reasoning_features, anchor_features, vl_padding_mask, reasoning_padding_mask
 
     def decode_with_cache(self,
         sample: torch.Tensor,
@@ -1214,6 +1219,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
+        heading: torch.Tensor,
         cond: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
@@ -1301,10 +1307,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
             reasoning_padding_mask = (reasoning_norm == 0)
         
-        # 4. Process conditions through encoder block to get memory (no timestep)
-        memory, vl_features, reasoning_features = self.encoder_block(
+        # 4. Process conditions through encoder block to get memory and fused anchor features
+        memory, vl_features, reasoning_features, anchor_features = self.encoder_block(
             vl_embeds=vl_embeds, 
             reasoning_embeds=reasoning_embeds,
+            heading=heading,embeds=reasoning_embeds,
             cond=cond, 
             vl_padding_mask=vl_padding_mask,
             reasoning_padding_mask=reasoning_padding_mask)
@@ -1355,15 +1362,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if hist_features is not None:
             x = x[:, -t:, :]
         
-        # 8. Predict anchor point from encoder memory if requested
+        # 8. Predict anchor point from fused features if requested
         predicted_anchor = None
         if return_anchor:
-            # Use memory from encoder to predict the 5th future waypoint
-            # Pool memory to get a global representation: (B, T_cond, n_emb) -> (B, n_emb)
-            memory_pooled = memory.mean(dim=1)  # Global average pooling
-            
-            # Predict anchor: (B, n_emb) -> (B, 2)
-            predicted_anchor = self.anchor_prediction_head(memory_pooled)  # (B, 2)
+            # Use fused anchor features from encoder (B, n_emb) -> (B, 2)
+            predicted_anchor = self.anchor_prediction_head(anchor_features)  # (B, 2)
             
             return x, predicted_anchor
             
