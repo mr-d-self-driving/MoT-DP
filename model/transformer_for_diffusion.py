@@ -378,11 +378,16 @@ class CustomEncoderBlock(nn.Module):
         )
         self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
 
+        # Reasoning features processing
+        self.reasoning_emb_dim = reasoning_emb_dim
+        self.reasoning_emb_proj = nn.Linear(reasoning_emb_dim, n_emb)
+        self.reasoning_emb_norm = nn.LayerNorm(n_emb)
+
         # Position embedding and preprocessing
         self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_encoder_norm = nn.LayerNorm(n_emb)
-        
+
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=n_emb,
