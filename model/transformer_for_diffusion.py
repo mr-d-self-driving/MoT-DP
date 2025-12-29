@@ -347,7 +347,7 @@ class CustomEncoderBlock(nn.Module):
     Encoder block that handles condition embedding, VL pooling, encoding, and memory projection
     """
     def __init__(self, n_emb, n_head, n_cond_layers, p_drop_emb, p_drop_attn, vl_emb_dim, 
-                 obs_as_cond, cond_dim, T_cond, heading_dim, reasoning_emb_dim=1536):
+                 obs_as_cond, cond_dim, T_cond, reasoning_emb_dim=1536):
         super().__init__()
         self.n_emb = n_emb
         self.obs_as_cond = obs_as_cond
@@ -360,7 +360,6 @@ class CustomEncoderBlock(nn.Module):
         self.cond_obs_emb = None
         if obs_as_cond:
             self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
-        self.heading_emb = nn.Linear(heading_dim, n_emb)
         
         # Position embedding and preprocessing
         self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
@@ -416,14 +415,12 @@ class CustomEncoderBlock(nn.Module):
         return pooled_features  # (B, 1, n_emb)
     
     def forward(self, vl_embeds: torch.Tensor, reasoning_embeds: Optional[torch.Tensor] = None, 
-                cond: Optional[torch.Tensor] = None, heading: Optional[torch.Tensor] = None,
-                vl_padding_mask: Optional[torch.Tensor] = None,
+                cond: Optional[torch.Tensor] = None, vl_padding_mask: Optional[torch.Tensor] = None,
                 reasoning_padding_mask: Optional[torch.Tensor] = None):
         """
         vl_embeds: (B, T_vl, D_vl) vision-language embeddings
         reasoning_embeds: (B, T_r, D_r) reasoning embeddings
-        cond: (B, T_cond, cond_dim) condition tensor
-        heading: (B, T_cond, heading_dim) heading tensor
+        cond: (B, T_cond, cond_dim) condition tensor (already includes heading info from BEV encoder)
         vl_padding_mask: (B, T_vl) padding mask for VL features
         reasoning_padding_mask: (B, T_r) padding mask for reasoning features
         Note: timestep is removed - memory generation does not use timesteps
@@ -445,7 +442,7 @@ class CustomEncoderBlock(nn.Module):
         reasoning_features = self.reasoning_emb_norm(reasoning_features)
         reasoning_first_token = reasoning_features[:, :1, :]  # (B, 1, n_emb) - only first token
         cond_list = []
-        cond_obs_emb = self.cond_obs_emb(cond) + self.heading_emb(heading)
+        cond_obs_emb = self.cond_obs_emb(cond)
         cond_list.append(cond_obs_emb)
         cond_list.append(vl_features_processed)
         cond_list.append(reasoning_first_token)
@@ -749,7 +746,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             n_cond_layers: int = 4,
             vl_emb_dim: int = 1536,
             reasoning_emb_dim: int = 1536, 
-            status_dim: int = 15,  
+            status_dim_anchor_goal: int = 14,  
             ego_status_seq_len: int = 1  
         ) -> None:
         super().__init__()
@@ -776,7 +773,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         # input embedding stem
         self.input_emb = nn.Linear(input_dim, n_emb)
-        self.hist_feature_emb = nn.Linear(status_dim, n_emb) # Embedding for full history state
+        self.hist_feature_emb = nn.Linear(status_dim_anchor_goal, n_emb) # Embedding for full history state
         self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
         self.hist_pos_emb = nn.Parameter(torch.zeros(1, n_obs_steps, n_emb))
         
@@ -791,14 +788,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.time_emb = SinusoidalPosEmb(n_emb)  
         
         # Linear projection for ego_status
-        self.status_dim = status_dim
-        self.ego_status_proj = nn.Linear(status_dim, n_emb)
+        self.status_dim_anchor_goal = status_dim_anchor_goal
+        self.ego_status_proj = nn.Linear(status_dim_anchor_goal, n_emb)
         
         # History Encoder for global modulation
-        self.history_encoder = HistoryEncoder(status_dim, n_emb)
-
-        self.heading_proj = nn.Linear(2, cond_dim) if cond_dim > 0 else None
-
+        self.history_encoder = HistoryEncoder(status_dim_anchor_goal, n_emb)
         # Custom encoder block that handles all condition processing (includes fusion logic)
         self.encoder_block = CustomEncoderBlock(
             n_emb=n_emb,
@@ -810,8 +804,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond=obs_as_cond,
             cond_dim=cond_dim,
             T_cond=T_cond,
-            heading_dim=2,  # Pass heading_dim for consistency
-            reasoning_emb_dim=reasoning_emb_dim # Pass reasoning_emb_dim
+            reasoning_emb_dim=reasoning_emb_dim
         )
         # Custom decoder that integrates VL cross attention and pre-processing
         custom_decoder_layer = CustomDecoderLayer(
@@ -1048,7 +1041,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
     def encode_conditions(self,
         cond: torch.Tensor,
-        heading: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
         reasoning_use_first_token: bool = False,
@@ -1099,7 +1091,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             vl_embeds=vl_embeds,
             reasoning_embeds=reasoning_embeds,
             cond=cond,
-            heading=heading,
             vl_padding_mask=vl_padding_mask,
             reasoning_padding_mask=reasoning_padding_mask,
         )
@@ -1219,7 +1210,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
-        heading: torch.Tensor,
         cond: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
@@ -1230,7 +1220,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         Args:
             sample: (B, T, input_dim) noisy trajectory
             timestep: diffusion timestep
-            cond: (B, n_obs_steps, cond_dim) condition features
+            cond: (B, n_obs_steps, cond_dim) condition features (already includes heading from BEV encoder)
             gen_vit_tokens: (B, seq_len, vl_emb_dim) VL features
             reasoning_query_tokens: (B, seq_len, reasoning_emb_dim) reasoning features
             ego_status: (B, status_dim) or (B, n_obs_steps, status_dim) ego status
@@ -1311,7 +1301,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         memory, vl_features, reasoning_features, anchor_features = self.encoder_block(
             vl_embeds=vl_embeds, 
             reasoning_embeds=reasoning_embeds,
-            heading=heading,embeds=reasoning_embeds,
             cond=cond, 
             vl_padding_mask=vl_padding_mask,
             reasoning_padding_mask=reasoning_padding_mask)

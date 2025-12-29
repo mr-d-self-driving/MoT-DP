@@ -92,7 +92,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         # Get status_dim from bev_encoder config
         status_dim = bev_encoder_cfg.get('state_dim', 15)
-        
+        status_dim_anchor_goal =  bev_encoder_cfg.get('status_dim_anchor_goal', 14)
         # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
 
@@ -110,7 +110,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             causal_attn=policy_cfg.get('causal_attn', True),
             obs_as_cond=obs_as_global_cond,
             n_cond_layers=policy_cfg.get('n_cond_layers', 4),
-            status_dim=status_dim,  # 传入 ego_status 维度
+            status_dim_anchor_goal=status_dim_anchor_goal,  # 传入 ego_status 维度
             ego_status_seq_len=ego_status_seq_len  # 传入 ego_status 序列长度
         )
 
